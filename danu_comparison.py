@@ -60,7 +60,7 @@ def save_final_results(results, dataset_name):
 # ============================
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_EPOCHS  = 300
-PATIENCE    = 30
+PATIENCE    = 50
 BATCH_SIZE  = 32
 HIDDEN_SIZE = 128
 NUM_SEEDS   = 10
@@ -264,65 +264,54 @@ class GRUModel(nn.Module):
 class DANUCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_compartments=4):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_comp    = num_compartments
-        self.comp_size   = hidden_size // num_compartments
+        self.K = num_compartments
+        self.H = hidden_size
         in_dim = input_size + hidden_size
 
-        self.W_E      = nn.ModuleList([nn.Linear(in_dim, hidden_size)
-                                       for _ in range(num_compartments)])
-        self.W_I      = nn.ModuleList([nn.Linear(in_dim, hidden_size)
-                                       for _ in range(num_compartments)])
-        self.lambda_I = nn.ParameterList([
-            nn.Parameter(torch.ones(hidden_size) * 0.1)
-            for _ in range(num_compartments)
-        ])
-        self.ln    = nn.ModuleList([nn.LayerNorm(hidden_size)
-                                    for _ in range(num_compartments)])
-        self.beta  = nn.ParameterList([nn.Parameter(torch.tensor(1.0))
-                                       for _ in range(num_compartments)])
-        self.theta = nn.ParameterList([nn.Parameter(torch.tensor(0.0))
-                                       for _ in range(num_compartments)])
-        self.gamma = nn.ParameterList([nn.Parameter(torch.tensor(0.1))
-                                       for _ in range(num_compartments)])
-        self.W_g   = nn.ModuleList([
-            nn.Linear(in_dim + hidden_size, hidden_size)
-            for _ in range(num_compartments)
-        ])
+        # Stack all compartments into single weight matrices
+        self.W_E = nn.Linear(in_dim, hidden_size * num_compartments)
+        self.W_I = nn.Linear(in_dim, hidden_size * num_compartments)
+        self.W_g = nn.Linear(in_dim + hidden_size,
+                             hidden_size * num_compartments)
+        self.lambda_I = nn.Parameter(
+            torch.ones(num_compartments, hidden_size) * 0.1)
+        self.ln    = nn.LayerNorm(hidden_size)
+        self.beta  = nn.Parameter(torch.ones(num_compartments, 1))
+        self.theta = nn.Parameter(torch.zeros(num_compartments, 1))
+        self.gamma = nn.Parameter(
+            torch.ones(num_compartments, 1) * 0.1)
         self.W_q    = nn.Linear(hidden_size, hidden_size)
         self.W_out  = nn.Linear(hidden_size, hidden_size)
         self.ln_out = nn.LayerNorm(hidden_size)
 
-    def sigma_EI(self, u, beta, theta, gamma):
-        sig  = torch.sigmoid(beta * (u - theta))
-        nmda = gamma * (u ** 2) / (1.0 + u ** 2)
-        return sig + nmda
-
     def forward(self, x, h):
-        xh = torch.cat([x, h], dim=1)
-        d_tilde = []
-        for k in range(self.num_comp):
-            excit = self.W_E[k](xh)
-            inhib = self.lambda_I[k] * self.W_I[k](xh)
-            u     = self.ln[k](excit - inhib)
-            d_tilde.append(self.sigma_EI(u, self.beta[k],
-                                          self.theta[k], self.gamma[k]))
+        B  = x.size(0)
+        xh = torch.cat([x, h], dim=1)   # [B, in_dim]
 
-        d_bar   = torch.stack(d_tilde, dim=1).mean(dim=1)
-        xh_dbar = torch.cat([xh, d_bar], dim=1)
-        d_gated = []
-        for k in range(self.num_comp):
-            g_k = torch.sigmoid(self.W_g[k](xh_dbar))
-            d_gated.append(g_k * d_tilde[k])
+        # All compartments in one matmul
+        E = self.W_E(xh).view(B, self.K, self.H)   # [B, K, H]
+        I = self.W_I(xh).view(B, self.K, self.H)   # [B, K, H]
+        u = E - self.lambda_I * I                   # [B, K, H]
+        u = self.ln(u)                              # broadcast over K
 
-        q      = self.W_q(h)
-        D      = torch.stack(d_gated, dim=1)
-        scores = torch.bmm(D, q.unsqueeze(2)).squeeze(2) / (self.hidden_size ** 0.5)
-        alpha  = torch.softmax(scores, dim=1)
+        sig  = torch.sigmoid(self.beta  * (u - self.theta))
+        nmda = self.gamma * (u**2) / (1.0 + u**2)
+        d_tilde = sig + nmda                        # [B, K, H]
 
-        attended    = (alpha.unsqueeze(2) * D).sum(dim=1)
-        h_candidate = self.W_out(attended)
-        h_new       = torch.tanh(self.ln_out(h_candidate + h))
+        # Gating
+        d_bar   = d_tilde.mean(dim=1, keepdim=True)             # [B, 1, H]
+        xh_dbar = torch.cat([xh, d_bar.squeeze(1)], dim=1)
+        G       = torch.sigmoid(
+            self.W_g(xh_dbar).view(B, self.K, self.H))          # [B, K, H]
+        d_gated = G * d_tilde                                    # [B, K, H]
+
+        # Attention
+        q      = self.W_q(h).unsqueeze(2)                       # [B, H, 1]
+        scores = torch.bmm(d_gated, q).squeeze(2) / (self.H**0.5)  # [B, K]
+        alpha  = torch.softmax(scores, dim=1)                   # [B, K]
+        attended = (alpha.unsqueeze(2) * d_gated).sum(dim=1)    # [B, H]
+
+        h_new = torch.tanh(self.ln_out(self.W_out(attended) + h))
         return h_new
 
 
@@ -527,7 +516,7 @@ def run_comparison(dataset_name,
         tractable_hist = train_model(
             tractable, train_loader, val_loader,
             max_epochs=max_epochs, patience=patience,
-            lr=1e-3, device=device,
+            lr=5e-4, device=device,
             clip_grad=True, max_grad_norm=1.0)
         print(f"    → stopped epoch {tractable_hist['stopped_epoch']}, "
               f"best val={tractable_hist['best_val']:.6f}")
@@ -536,7 +525,7 @@ def run_comparison(dataset_name,
         gru_hist = train_model(
             gru, train_loader, val_loader,
             max_epochs=max_epochs, patience=patience,
-            lr=1e-3, device=device,
+            lr=1e-4, device=device,
             clip_grad=True, max_grad_norm=1.0)
         print(f"    → stopped epoch {gru_hist['stopped_epoch']}, "
               f"best val={gru_hist['best_val']:.6f}")
@@ -545,11 +534,11 @@ def run_comparison(dataset_name,
         lstm_hist = train_model(
             lstm, train_loader, val_loader,
             max_epochs=max_epochs, patience=patience,
-            lr=1e-3, device=device,
+            lr=5e-5, device=device,
             clip_grad=True, max_grad_norm=1.0)
         print(f"    → stopped epoch {lstm_hist['stopped_epoch']}, "
               f"best val={lstm_hist['best_val']:.6f}")
-        '''
+
         print("  Training DANU...")
         danu_hist = train_model(
             danu, train_loader, val_loader,
@@ -559,9 +548,9 @@ def run_comparison(dataset_name,
         print(f"    → stopped epoch {danu_hist['stopped_epoch']}, "
               f"best val={danu_hist['best_val']:.6f}")
         '''
-        danu_hist = {"train_loss": [], "val_loss": [], 
+        danu_hist = {"train_loss": [], "val_loss": [],
              "stopped_epoch": 0, "best_val": float('nan')}
-
+        '''
         t_best  = tractable_hist['best_val']
         g_best  = gru_hist['best_val']
         l_best  = lstm_hist['best_val']
@@ -596,9 +585,9 @@ def run_comparison(dataset_name,
         all_danu_hist.append(danu_hist)
         final_metrics.append(seed_metrics)
 
-        #print(f"  DANU: {da_best:.6f} | Tractable: {t_best:.6f} | "
-        #      f"GRU: {g_best:.6f} | LSTM: {l_best:.6f}")
-        print(f"  Tractable: {t_best:.6f} | GRU: {g_best:.6f} | LSTM: {l_best:.6f}")
+        print(f"  DANU: {da_best:.6f} | Tractable: {t_best:.6f} | "
+              f"GRU: {g_best:.6f} | LSTM: {l_best:.6f}")
+        #print(f"  Tractable: {t_best:.6f} | GRU: {g_best:.6f} | LSTM: {l_best:.6f}")
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
     def pad_and_stack(hist_list, key):
