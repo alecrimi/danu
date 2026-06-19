@@ -90,7 +90,9 @@ def load_subjects(data_dir, metadata_file, target_fs=200, grades=None):
     meta.columns = [c.strip().lower() for c in meta.columns]
 
     # filter by sampling frequency
-    meta_fs = meta[meta["sampling_freq"] == target_fs].copy()
+    meta_fs = meta[ (meta["sampling_freq"] == target_fs) & (meta["reference"] == "C3-C4")].copy()
+
+            
     print(f"[Data] {len(meta_fs)} subjects at {target_fs} Hz "
           f"(out of {len(meta)} total)")
 
@@ -113,36 +115,37 @@ def load_subjects(data_dir, metadata_file, target_fs=200, grades=None):
 
     loaded, skipped = 0, 0
     for _, row in meta_fs.iterrows():
-        subj_id = str(row[id_col]).strip()
-        grade   = int(row["grade"])
-        fs      = float(row["sampling_freq"])
 
-        # try several filename patterns
-        candidates = [
-            os.path.join(data_dir, f"{subj_id}_epoch1.edf"),
-            os.path.join(data_dir, f"{subj_id}.edf"),
-            os.path.join(data_dir, f"{subj_id}_epoch1.EDF"),
-        ]
-        edf_path = next((p for p in candidates if os.path.exists(p)), None)
-        if edf_path is None:
-            print(f"  [WARN] EDF not found for {subj_id} — skipping")
-            skipped += 1
-            continue
+                file_id = str(row["file_id"]).strip()
+                baby_id = str(row["baby_id"]).strip()
+                grade   = int(row["grade"])
+            
+                edf_path = os.path.join(data_dir, f"{file_id}.edf")
+            
+                if not os.path.exists(edf_path):
+                    print(f"[WARN] EDF not found: {edf_path}")
+                    skipped += 1
+                    continue
+            
+                try:
+                    data, sfreq = load_edf(edf_path)
+            
+                    if abs(sfreq - target_fs) > 0.5:
+                        data = resample_signal(data, sfreq, target_fs)
+            
+                    data = (
+                        data - data.mean(axis=1, keepdims=True)
+                    ) / (
+                        data.std(axis=1, keepdims=True) + 1e-8
+                    )
+            
+                    grade_data[grade].append(data)
+            
+                    loaded += 1
 
-        try:
-            data, sfreq = load_edf(edf_path)
-            # resample if needed (shouldn't be, but just in case)
-            if abs(sfreq - target_fs) > 0.5:
-                data = resample_signal(data, sfreq, target_fs)
-            # z-score each channel independently
-            data = (data - data.mean(axis=1, keepdims=True)) / \
-                   (data.std(axis=1, keepdims=True) + 1e-8)
-            grade_data[grade].append(data)
-            loaded += 1
-        except Exception as e:
-            print(f"  [WARN] Error loading {edf_path}: {e}")
-            skipped += 1
-
+    except Exception as e:
+        print(f"[WARN] Error loading {edf_path}: {e}")
+        skipped += 1
     print(f"[Data] Loaded {loaded} subjects, skipped {skipped}")
     for g, slist in grade_data.items():
         print(f"  Grade {g}: {len(slist)} subjects")
