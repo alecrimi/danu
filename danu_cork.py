@@ -37,7 +37,7 @@ except ImportError:
 # CONFIG
 # ─────────────────────────────────────────────
 DATA_DIR        = "EDF_format"
-METADATA_FILE   = os.path.join(DATA_DIR, "metadata.csv")
+METADATA_FILE   =  "metadata.csv"
 TARGET_FS       = 200          # Hz — only subjects recorded at this fs
 GRADES          = [1, 2, 3, 4] # grades to include
 SEQ_LEN         = 256          # input window (1.28 s at 200 Hz)
