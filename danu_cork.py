@@ -143,9 +143,9 @@ def load_subjects(data_dir, metadata_file, target_fs=200, grades=None):
             
                     loaded += 1
 
-    except Exception as e:
-        print(f"[WARN] Error loading {edf_path}: {e}")
-        skipped += 1
+                except Exception as e:
+                    print(f"[WARN] Error loading {edf_path}: {e}")
+                    skipped += 1
     print(f"[Data] Loaded {loaded} subjects, skipped {skipped}")
     for g, slist in grade_data.items():
         print(f"  Grade {g}: {len(slist)} subjects")
