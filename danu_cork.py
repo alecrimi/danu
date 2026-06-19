@@ -102,10 +102,11 @@ def load_subjects(data_dir, metadata_file, target_fs=200, grades=None):
 
     # try common subject_id column names
     id_col = None
-    for c in ["subject_id", "id", "subject", "subjectid", "participant_id"]:
+    for c in ["baby_id", "subject_id", "id", "subject",  "subjectid", "participant_id"]:
         if c in meta_fs.columns:
-            id_col = c
-            break
+                    id_col = c
+                    break
+                
     if id_col is None:
         raise ValueError(f"Cannot find subject ID column. "
                          f"Columns found: {list(meta_fs.columns)}")
